@@ -6,6 +6,8 @@
 #[cfg(minimal_rt)]
 #[expect(clippy::missing_safety_doc)]
 mod instead_of_builtins {
+    use core::ffi::c_void;
+
     /// Implementation cribbed from compiler_builtins.
     #[inline(always)]
     unsafe fn copy_backward_bytes(mut dest: *mut u8, mut src: *const u8, n: usize) {
@@ -24,39 +26,44 @@ mod instead_of_builtins {
     // SAFETY: The minimal_rt_build crate ensures that when this code is compiled
     // there is no libc for this to conflict with.
     #[unsafe(no_mangle)]
-    unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, len: usize) -> *mut u8 {
+    unsafe extern "C" fn memcpy(dest: *mut c_void, src: *const c_void, len: usize) -> *mut c_void {
+        let dest = dest.cast::<u8>();
+        let src = src.cast::<u8>();
         for i in 0..len {
             // SAFETY: the caller guarantees the pointer and length are correct.
             unsafe { core::ptr::write(dest.add(i), core::ptr::read(src.add(i))) };
         }
 
-        dest
+        dest.cast()
     }
 
     /// Hand rolled implementation of memset.
     // SAFETY: The minimal_rt_build crate ensures that when this code is compiled
     // there is no libc for this to conflict with.
     #[unsafe(no_mangle)]
-    unsafe extern "C" fn memset(ptr: *mut u8, val: i32, len: usize) -> *mut u8 {
+    unsafe extern "C" fn memset(ptr: *mut c_void, val: i32, len: usize) -> *mut c_void {
+        let ptr = ptr.cast::<u8>();
         for i in 0..len {
             // SAFETY: the caller guarantees the pointer and length are correct.
             unsafe { core::ptr::write(ptr.add(i), val as u8) };
         }
 
-        ptr
+        ptr.cast()
     }
 
     /// Implementation cribbed from compiler_builtins.
     // SAFETY: The minimal_rt_build crate ensures that when this code is compiled
     // there is no libc for this to conflict with.
     #[unsafe(no_mangle)]
-    unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    unsafe extern "C" fn memmove(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
+        let dest = dest.cast::<u8>();
+        let src = src.cast::<u8>();
         let delta = (dest as usize).wrapping_sub(src as usize);
         if delta >= n {
             // SAFETY: We can copy forwards because either dest is far enough ahead of src,
             // or src is ahead of dest (and delta overflowed).
             unsafe {
-                memcpy(dest, src, n);
+                memcpy(dest.cast(), src.cast(), n);
             }
         } else {
             // SAFETY: dest and src must be copied backward due to src and dest.
@@ -66,7 +73,7 @@ mod instead_of_builtins {
                 copy_backward_bytes(dest, src, n);
             }
         }
-        dest
+        dest.cast()
     }
 
     /// This implementation is cribbed from compiler_builtins. It would be nice to
@@ -75,7 +82,9 @@ mod instead_of_builtins {
     // SAFETY: The minimal_rt_build crate ensures that when this code is compiled
     // there is no libc for this to conflict with.
     #[unsafe(no_mangle)]
-    unsafe extern "C" fn bcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
+    unsafe extern "C" fn bcmp(s1: *const c_void, s2: *const c_void, n: usize) -> i32 {
+        let s1 = s1.cast::<u8>();
+        let s2 = s2.cast::<u8>();
         // SAFETY: The caller guarantees that the pointers and length are correct.
         unsafe {
             let mut i = 0;
