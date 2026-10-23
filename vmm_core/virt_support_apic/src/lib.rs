@@ -1198,7 +1198,7 @@ impl SharedState {
             DeliveryMode::NMI => {
                 let old = self
                     .work
-                    .fetch_update(Ordering::Release, Ordering::Relaxed, |w| {
+                    .try_update(Ordering::Release, Ordering::Relaxed, |w| {
                         Some(WorkFlags::from(w).with_nmi(true).into())
                     })
                     .unwrap();
@@ -1207,7 +1207,7 @@ impl SharedState {
             DeliveryMode::INIT => {
                 let old = self
                     .work
-                    .fetch_update(Ordering::Release, Ordering::Relaxed, |w| {
+                    .try_update(Ordering::Release, Ordering::Relaxed, |w| {
                         Some(WorkFlags::from(w).with_init(true).into())
                     })
                     .unwrap();
@@ -1216,7 +1216,7 @@ impl SharedState {
             DeliveryMode::SIPI => {
                 let old = self
                     .work
-                    .fetch_update(Ordering::Release, Ordering::Relaxed, |w| {
+                    .try_update(Ordering::Release, Ordering::Relaxed, |w| {
                         Some(
                             WorkFlags::from(w)
                                 .with_sipi(true)
@@ -1230,7 +1230,7 @@ impl SharedState {
             DeliveryMode::EXTINT => {
                 let old = self
                     .work
-                    .fetch_update(Ordering::Release, Ordering::Relaxed, |w| {
+                    .try_update(Ordering::Release, Ordering::Relaxed, |w| {
                         Some(WorkFlags::from(w).with_extint(true).into())
                     })
                     .unwrap();

@@ -336,7 +336,7 @@ impl Bat {
         let rc = &self.io_refcounts[block_number as usize];
         loop {
             let listener = self.refcount_event.listen();
-            let result = rc.fetch_update(Ordering::AcqRel, Ordering::Acquire, |raw| {
+            let result = rc.try_update(Ordering::AcqRel, Ordering::Acquire, |raw| {
                 let old = IoBlockRef(raw);
                 match old {
                     // Idle — claim directly.
