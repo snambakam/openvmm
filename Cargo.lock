@@ -6551,6 +6551,7 @@ dependencies = [
  "pal_event",
  "seccompiler",
  "socket2",
+ "tempfile",
  "test_with_tracing",
  "thiserror 2.0.16",
  "tracing",
