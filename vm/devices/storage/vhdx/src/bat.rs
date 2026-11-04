@@ -297,17 +297,10 @@ impl Bat {
     /// - The block is trim-claimed (`TRIM_CLAIMED`).
     fn try_increment_io_refcount(&self, block_number: u32) -> bool {
         let rc = &self.io_refcounts[block_number as usize];
-        loop {
-            let old = IoBlockRef(rc.load(Ordering::Acquire));
-            if old.blocks_new_io() {
-                return false;
-            }
-            let new = old.0 + 1;
-            match rc.compare_exchange_weak(old.0, new, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => return true,
-                Err(_) => continue,
-            }
-        }
+        rc.try_update(Ordering::AcqRel, Ordering::Acquire, |raw| {
+            (!IoBlockRef(raw).blocks_new_io()).then(|| raw + 1)
+        })
+        .is_ok()
     }
 
     /// Atomically decrement the I/O refcount.
