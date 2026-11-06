@@ -5,6 +5,7 @@
 
 mod vm_state;
 mod vp_state;
+pub(super) mod vsm;
 
 use crate::Error;
 use crate::ErrorInner;

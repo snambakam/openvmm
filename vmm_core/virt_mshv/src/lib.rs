@@ -17,6 +17,11 @@ use aarch64 as arch;
 #[cfg(guest_arch = "x86_64")]
 use x86_64 as arch;
 
+#[cfg(guest_arch = "x86_64")]
+pub use arch::vsm::VsmProbeResult;
+#[cfg(guest_arch = "x86_64")]
+pub use arch::vsm::probe_vtl2;
+
 // irqfd is arch-independent (MSI routing + MSHV_IRQFD), wired up on both
 // x86_64 and aarch64.
 pub mod irqfd;
