@@ -378,15 +378,21 @@ impl RcuDomain {
             );
         }
         // Update the domain's sequence number.
-        let seq = self
-            .data
-            .seq
-            .fetch_update(SeqCst, Relaxed, |seq| {
-                seq.checked_add(SEQ_INCREMENT)
-                    .filter(|next| next & SEQ_MASK_QUIESCED == 0)
-            })
-            .expect("RCU sequence number exhausted")
-            + SEQ_INCREMENT;
+        let mut seq = self.data.seq.load(Relaxed);
+        let seq = loop {
+            let next = seq
+                .checked_add(SEQ_INCREMENT)
+                .filter(|next| next & SEQ_MASK_QUIESCED == 0)
+                .expect("RCU sequence number exhausted");
+            match self
+                .data
+                .seq
+                .compare_exchange_weak(seq, next, SeqCst, Relaxed)
+            {
+                Ok(_) => break next,
+                Err(current) => seq = current,
+            }
+        };
         // We need to make sure all threads are quiesced, not busy, or have
         // observed the new sequence number. To do this, we must synchronize the
         // global sequence number update with changes to each thread's local
