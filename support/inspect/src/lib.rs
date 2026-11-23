@@ -1529,6 +1529,7 @@ macro_rules! inspect_value {
 
 inspect_value_immut! {
     str,
+    String,
     #[cfg(feature = "std")]
     std::ffi::CStr,
     #[cfg(feature = "std")]
@@ -1562,7 +1563,18 @@ inspect_value! {
     f32,
     f64,
     bool,
-    String,
+}
+
+impl InspectMut for String {
+    fn inspect_mut(&mut self, req: Request<'_>) {
+        match req.update() {
+            Ok(req) => {
+                *self = req.new_value().to_string();
+                req.succeed(&*self);
+            }
+            Err(req) => req.value(&*self),
+        }
+    }
 }
 
 impl<const N: usize> Inspect for [u8; N] {
@@ -2768,6 +2780,19 @@ mod tests {
         );
         assert_eq!(foo.mut_, 3);
         assert_eq!(foo.child.as_ref().unwrap().mut_, 103);
+    }
+
+    #[test]
+    fn test_update_string() {
+        let mut value = "initial".to_string();
+        for new_value in ["replacement\n\"text\"", ""] {
+            let result = update("", new_value, &mut value)
+                .now_or_never()
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.kind, ValueKind::String(new_value.to_string()));
+            assert_eq!(value, new_value);
+        }
     }
 
     #[test]
