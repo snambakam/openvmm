@@ -32,6 +32,8 @@ before their implementation is connected end to end.
 * TeardownVM
 * PauseVM
 * ResumeVM
+* SaveVM
+* RestoreVM
 * ShutdownVM
 * WaitVM
 * CapabilitiesVM
@@ -42,6 +44,28 @@ before their implementation is connected end to end.
 * AddVpciDevice
 * RemoveVpciDevice
 * Quit
+
+## Snapshots (SaveVM and RestoreVM)
+
+`SaveVM` is a compound operation that pauses the VM and writes `manifest.bin`,
+`state.bin`, and `memory.bin` to the requested directory. The VM must use the
+`MemoryConfig.backing_file_path` setting. The currently supported
+implementation hard-links that backing file into the snapshot, so after a
+successful save the VM can't be resumed and should be torn down. Each save
+generates a unique snapshot ID (a GUID string) that is stored in
+`manifest.bin` and returned in `SaveVMResponse.snapshot_id`.
+Cancelling `SaveVM` only stops the caller from waiting; the save may still
+complete.
+
+`RestoreVM` creates a VM from a snapshot directory and a compatible
+`VMConfig`. Device configuration is not stored in the snapshot and must be
+supplied by the caller. `memory.bin` is used directly as mutable guest memory,
+so `MemoryConfig.backing_file_path` must not be set, and a snapshot can be
+restored only once. If `expected_snapshot_id` is provided, the restore fails
+unless it matches the snapshot ID in `manifest.bin`. An empty value is treated
+as not provided, so the ID isn't checked. The restored snapshot's
+ID is returned in `RestoreVMResponse.snapshot_id`. Set `resume` to start the
+restored VM immediately; otherwise it is created paused.
 
 ## Virtio-console file output
 
@@ -83,6 +107,19 @@ output survives a host crash or power failure.
 If a write fails, OpenVMM logs the error and disconnects the file backend.
 Further console output is discarded; the backend does not automatically retry
 or reopen the file.
+
+## Passing handles on Windows
+
+Some API fields reference OS handles by name. For example,
+`VirtioFs.WindowsOptions.user_token_name` names an access token that virtio-fs
+impersonates for host file access.
+
+Clients register these handles over the same socket using the
+[resource-passing protocol]. Because Windows Unix sockets cannot carry handles,
+the client duplicates each handle into the OpenVMM process with
+`DuplicateHandle`, which requires `PROCESS_DUP_HANDLE` access to it, and sends
+the handle value under a name. OpenVMM makes its own duplicate; the client then
+closes its copy in OpenVMM.
 
 ## Graceful guest shutdown
 
@@ -246,3 +283,4 @@ When editing `vmservice.proto`, follow the
 [Protocol Buffers enum conventions](../../../dev_guide/contrib/code.md#protocol-buffers-enums).
 
 [`vmservice.proto`]: https://github.com/microsoft/openvmm/blob/main/openvmm/openvmm_ttrpc_vmservice/src/vmservice.proto
+[resource-passing protocol]: https://github.com/microsoft/openvmm/blob/main/openvmm/openvmm_ttrpc_vmservice/src/resource_passing.md

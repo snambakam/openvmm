@@ -5,19 +5,32 @@
 
 #![cfg(any(feature = "ttrpc", feature = "grpc"))]
 
-// The fd-passing protocol relies on `SCM_RIGHTS` and so exists only on unix.
+// Clients pass OS resources to the server by name: file descriptors via the
+// fd-passing protocol on unix (`SCM_RIGHTS`), and handles via the
+// handle-passing protocol on Windows (`DuplicateHandle`). Both are built on the
+// platform-independent core in `resource_passing`; each platform module
+// provides only its `Connection` transport, selected here as
+// `resource_transport`.
 #[cfg(unix)]
 mod fd_passing;
+#[cfg(windows)]
+mod handle_passing;
+mod resource_passing;
 
-#[cfg(unix)]
-use fd_passing::FdRegistry;
+cfg_select! {
+    unix => {
+        use fd_passing as resource_transport;
+    }
+    windows => {
+        use handle_passing as resource_transport;
+    }
+}
 
-/// On non-unix platforms the fd-passing protocol does not exist. The registry
-/// is still threaded through the shared NIC configuration code, so provide an
-/// empty placeholder there; it is never populated or resolved.
-#[cfg(not(unix))]
-#[derive(Clone, Default)]
-struct FdRegistry {}
+/// The registry of OS resources (fds or handles) passed in by clients, keyed by
+/// client-chosen name.
+type ResourceRegistry = resource_passing::Registry<
+    <resource_transport::Connection as resource_passing::Transport>::Resource,
+>;
 
 use crate::cli_args::DiskCliKind;
 use crate::cli_args::GuestPowerAction;
@@ -104,6 +117,7 @@ use pal_async::task::Task;
 use scsidisk_resources::SimpleScsiDiskHandle;
 use std::fs::File;
 use std::future::Future;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -152,21 +166,20 @@ fn parse_arch_topology_overrides(
     use vmservice::processor_config::ArchConfig as ProtoArchConfig;
 
     match processor_cfg.and_then(|cfg| cfg.arch_config.as_ref()) {
-        #[cfg(not(guest_arch = "x86_64"))]
         Some(ProtoArchConfig::X86(_)) => {
-            bail!("x86 topology overrides not supported on current arch")
+            cfg_select! {
+                guest_arch = "x86_64" => Ok(None), // No overrides on type currently.
+                _ => bail!("x86 topology overrides not supported on current arch"),
+            }
         }
-        #[cfg(guest_arch = "x86_64")]
-        Some(ProtoArchConfig::X86(_x86cfg)) => {
-            Ok(None) // No overrides on type currently.
-        }
-        #[cfg(not(guest_arch = "aarch64"))]
-        Some(ProtoArchConfig::Aarch64(_)) => {
-            bail!("aarch64 topology overrides not supported on current arch")
-        }
-        #[cfg(guest_arch = "aarch64")]
         Some(ProtoArchConfig::Aarch64(aarch64)) => {
-            Ok(Some(parse_aarch64_topology_overrides(aarch64)?))
+            cfg_select! {
+                guest_arch = "aarch64" => Ok(Some(parse_aarch64_topology_overrides(aarch64)?)),
+                _ => {{
+                    let _ = aarch64;
+                    bail!("aarch64 topology overrides not supported on current arch")
+                }},
+            }
         }
         None => Ok(None),
     }
@@ -247,11 +260,12 @@ impl ResolvedTransport {
 ///   so the first byte is `0x00`.
 /// * gRPC uses HTTP/2 cleartext, whose client connection preface begins with
 ///   the ASCII bytes `"PRI "`, so the first byte is `b'P'`.
-/// * The OpenVMM fd-passing protocol (UNIX only) begins with a handshake whose
-///   first byte is `0xFD`, distinct from both of the above.
+/// * The OpenVMM fd-passing (unix) and handle-passing (Windows) protocols begin
+///   with a handshake whose first byte is `0xFD`, distinct from both of the
+///   above.
 mod dispatch {
-    use super::FdRegistry;
     use super::ResolvedTransport;
+    use super::ResourceRegistry;
     use futures::FutureExt;
     use pal_async::driver::Driver;
     use pal_async::socket::AsSockRef;
@@ -270,7 +284,7 @@ mod dispatch {
         listener: UnixListener,
         cancel: mesh::OneshotReceiver<()>,
         transport: ResolvedTransport,
-        registry: FdRegistry,
+        registry: ResourceRegistry,
     ) -> anyhow::Result<()> {
         let mut listener = PolledSocket::new(driver, listener)?;
         let mut tasks = FuturesUnordered::new();
@@ -307,7 +321,7 @@ mod dispatch {
         server: &mesh_rpc::Server,
         mut conn: PolledSocket<UnixStream>,
         transport: ResolvedTransport,
-        registry: &FdRegistry,
+        registry: &ResourceRegistry,
     ) -> anyhow::Result<()> {
         // Wait for the client to send data (returning early if it hangs up
         // first) and classify the protocol from its first byte.
@@ -315,19 +329,18 @@ mod dispatch {
             return Ok(());
         };
 
-        // The fd-passing protocol (UNIX only) is allowed in every transport
-        // mode; it shares the socket with ttrpc/gRPC and is selected by its
-        // distinct magic first byte.
-        #[cfg(not(unix))]
-        let _ = registry;
-
+        // The fd-passing (UNIX) and handle-passing (Windows) protocols are
+        // allowed in every transport mode; they share the socket with
+        // ttrpc/gRPC and are selected by their common magic first byte.
         match first_byte {
             #[cfg(feature = "ttrpc")]
             0x00 if transport.allows_ttrpc() => server.serve_connection(conn).await,
             #[cfg(feature = "grpc")]
             b'P' if transport.allows_grpc() => server.serve_connection_grpc(conn).await,
-            #[cfg(unix)]
-            super::fd_passing::MAGIC_FIRST_BYTE => super::fd_passing::serve(conn, registry).await,
+            super::resource_passing::wire::MAGIC_FIRST_BYTE => {
+                let mut conn = super::resource_transport::Connection::new(conn);
+                super::resource_passing::serve(&mut conn, registry).await
+            }
             byte => {
                 anyhow::bail!("unrecognized or disallowed rpc protocol (first byte {byte:#04x})")
             }
@@ -392,9 +405,11 @@ impl Worker for TtrpcWorker {
                 controller_task: None,
                 wait_vm_response: None,
                 lifecycle: VmLifecycle::Uninitialized,
+                snapshot_saved: false,
+                memory_backing_file: None,
                 rpc_tasks: Vec::new(),
                 transport: self.transport,
-                registry: FdRegistry::default(),
+                registry: ResourceRegistry::default(),
             };
             let code = service.run(self.listener, recv).await?;
             self.exit_code.send(code);
@@ -610,25 +625,27 @@ impl IommufdContexts {
             );
         }
 
-        #[cfg(target_os = "linux")]
-        {
-            let files = configs
-                .into_iter()
-                .map(|config| {
-                    let file = File::options()
-                        .read(true)
-                        .write(true)
-                        .open("/dev/iommu")
-                        .with_context(|| format!("failed to open /dev/iommu for {}", config.id))?;
-                    Ok((config.id, file))
-                })
-                .collect::<anyhow::Result<_>>()?;
-            Ok(Self { files })
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            anyhow::ensure!(configs.is_empty(), "iommufd is only supported on Linux");
-            Ok(Self::default())
+        cfg_select! {
+            target_os = "linux" => {{
+                let files = configs
+                    .into_iter()
+                    .map(|config| {
+                        let file = File::options()
+                            .read(true)
+                            .write(true)
+                            .open("/dev/iommu")
+                            .with_context(|| {
+                                format!("failed to open /dev/iommu for {}", config.id)
+                            })?;
+                        Ok((config.id, file))
+                    })
+                    .collect::<anyhow::Result<_>>()?;
+                Ok(Self { files })
+            }}
+            _ => {{
+                anyhow::ensure!(configs.is_empty(), "iommufd is only supported on Linux");
+                Ok(Self::default())
+            }}
         }
     }
 
@@ -674,7 +691,7 @@ fn validate_platform_config(config: &vmservice::VmConfig) -> anyhow::Result<()> 
                     .all(|nic| nic.frontend == vmservice::NicFrontend::Virtio as i32),
                 "VMBus NICConfig requires VMBus; use the virtio frontend instead"
             );
-            if cfg!(windows) || cfg!(target_os = "macos") {
+            if cfg!(any(windows, target_os = "macos")) {
                 anyhow::ensure!(
                     devices.virtiofs_config.is_empty()
                         && devices
@@ -737,6 +754,65 @@ enum VmLifecycle {
     Halted(String),
 }
 
+struct RestoreParameters {
+    source_dir: PathBuf,
+    /// The snapshot manifest, already validated against the caller's
+    /// expectations and the host.
+    manifest: openvmm_helpers::snapshot::SnapshotManifest,
+    state_bytes: Vec<u8>,
+}
+
+struct PreparedRestore {
+    shared_memory: openvmm_defs::worker::SharedMemoryFd,
+    saved_state: mesh::payload::message::ProtobufMessage,
+    snapshot_id: Guid,
+}
+
+/// Validates the snapshot against the VM configuration and opens its memory.
+/// The manifest and saved state were read and checked up front by
+/// `restore_vm`.
+fn prepare_snapshot_restore(
+    restore: &RestoreParameters,
+    expected_memory_size: u64,
+    expected_vp_count: u32,
+) -> anyhow::Result<PreparedRestore> {
+    let RestoreParameters {
+        source_dir,
+        manifest,
+        state_bytes,
+    } = restore;
+    openvmm_helpers::snapshot::validate_manifest(
+        manifest,
+        crate::GUEST_ARCH,
+        expected_memory_size,
+        expected_vp_count,
+        crate::system_page_size(),
+    )?;
+
+    let memory_file = fs_err::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(source_dir.join("memory.bin"))
+        .context("failed to open snapshot memory.bin")?;
+    let file_size = memory_file.metadata()?.len();
+    if file_size != manifest.memory_size_bytes {
+        return Err(anyhow!(Code::FailedPrecondition).context(format!(
+            "memory.bin size ({file_size} bytes) doesn't match manifest ({} bytes)",
+            manifest.memory_size_bytes,
+        )));
+    }
+
+    let shared_memory =
+        openvmm_helpers::shared_memory::file_to_shared_memory_fd(memory_file.into())?;
+    let saved_state =
+        mesh::payload::decode(state_bytes).context("failed to decode saved state from snapshot")?;
+    Ok(PreparedRestore {
+        shared_memory,
+        saved_state,
+        snapshot_id: manifest.snapshot_id,
+    })
+}
+
 impl From<&VmLifecycle> for vmservice::VmState {
     fn from(lifecycle: &VmLifecycle) -> Self {
         match lifecycle {
@@ -756,11 +832,16 @@ struct VmService {
     controller_task: Option<Task<()>>,
     wait_vm_response: Option<(mesh::CancelContext, mesh::OneshotSender<Result<(), Status>>)>,
     lifecycle: VmLifecycle,
+    snapshot_saved: bool,
+    /// The current VM's guest memory backing file, if any. SaveVM requires
+    /// one.
+    memory_backing_file: Option<PathBuf>,
     rpc_tasks: Vec<Task<()>>,
     transport: ResolvedTransport,
-    /// Registry of file descriptors passed in over the fd-passing protocol,
-    /// resolvable by name (e.g. for tap NIC backends).
-    registry: FdRegistry,
+    /// Registry of OS resources passed in over the fd-passing or
+    /// handle-passing protocol, resolvable by name (e.g. for tap NIC backends
+    /// or virtio-fs user tokens).
+    registry: ResourceRegistry,
 }
 
 fn grpc_error(err: anyhow::Error) -> Status {
@@ -830,6 +911,40 @@ impl VmService {
             }
             vmservice::Vm::ResumeVm((), response) => {
                 response.send(map_grpc(self.resume_vm().await));
+            }
+            vmservice::Vm::SaveVm(request, response) => {
+                // Stop waiting if the client cancels or its deadline expires.
+                // `save_vm` leaves the service in a safe state if it is
+                // dropped mid-await.
+                let mut ctx = ctx;
+                let r = ctx
+                    .until_cancelled(self.save_vm(request))
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|r| r);
+                response.send(map_grpc(r));
+            }
+            vmservice::Vm::RestoreVm(request, response) => {
+                // Restore the VM paused, and resume it only after it has been
+                // committed to the service. A cancel can then only abandon the
+                // restore before the guest runs and modifies the snapshot's
+                // memory.bin.
+                let resume = request.resume;
+                let mut ctx = ctx;
+                let r = ctx
+                    .until_cancelled(self.restore_vm(request))
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|r| r);
+                let r = match r {
+                    Ok(result) if resume => self
+                        .resume_vm()
+                        .await
+                        .context("failed to resume restored VM")
+                        .map(|()| result),
+                    r => r,
+                };
+                response.send(map_grpc(r));
             }
             vmservice::Vm::ShutdownVm(request, response) => {
                 let r = self.shutdown_vm(ctx, request);
@@ -929,8 +1044,72 @@ impl VmService {
     }
 
     async fn create_vm(&mut self, request: vmservice::CreateVmRequest) -> anyhow::Result<()> {
-        let mut req_config = request.config.context("missing configuration")?;
+        let req_config = request.config.context("missing configuration")?;
+        self.create_vm_inner(req_config, None).await.map(drop)
+    }
 
+    async fn restore_vm(
+        &mut self,
+        request: vmservice::RestoreVmRequest,
+    ) -> anyhow::Result<vmservice::RestoreVmResponse> {
+        let source_dir = PathBuf::from(request.source_dir);
+        if source_dir.as_os_str().is_empty() {
+            return Err(anyhow!(Code::InvalidArgument).context("missing snapshot source directory"));
+        }
+        // An empty expected ID is treated as not provided, so the snapshot ID
+        // check is skipped.
+        let expected_snapshot_id = request
+            .expected_snapshot_id
+            .filter(|id| !id.is_empty())
+            .map(|id| {
+                id.parse::<Guid>().map_err(|err| {
+                    anyhow!(Code::InvalidArgument)
+                        .context(format!("invalid expected_snapshot_id: {err}"))
+                })
+            })
+            .transpose()?;
+        let config = request
+            .config
+            .ok_or_else(|| anyhow!(Code::InvalidArgument).context("missing configuration"))?;
+        if self.vm.is_some() {
+            return Err(anyhow!(Code::FailedPrecondition).context("VM already created"));
+        }
+
+        // Read the manifest and check the snapshot ID before doing any
+        // expensive VM construction, so a wrong snapshot fails fast. The rest
+        // of the manifest is validated against the VM configuration later.
+        let (manifest, state_bytes) = openvmm_helpers::snapshot::read_snapshot(&source_dir)?;
+        openvmm_helpers::snapshot::validate_expectations(
+            &manifest,
+            &openvmm_helpers::snapshot::SnapshotExpectations {
+                snapshot_id: expected_snapshot_id,
+            },
+        )
+        .map_err(|err| anyhow!(Code::FailedPrecondition).context(format!("{err:#}")))?;
+
+        let snapshot_id = self
+            .create_vm_inner(
+                config,
+                Some(RestoreParameters {
+                    source_dir,
+                    manifest,
+                    state_bytes,
+                }),
+            )
+            .await?
+            .context("restore did not produce a snapshot ID")?;
+        Ok(vmservice::RestoreVmResponse {
+            snapshot_id: snapshot_id.to_string(),
+        })
+    }
+
+    /// Creates a VM, optionally restoring it from a snapshot. Returns the
+    /// snapshot ID from the manifest when restoring.
+    async fn create_vm_inner(
+        &mut self,
+        mut req_config: vmservice::VmConfig,
+        restore: Option<RestoreParameters>,
+    ) -> anyhow::Result<Option<Guid>> {
         if self.vm.is_some() {
             bail!("VM already created");
         }
@@ -940,8 +1119,8 @@ impl VmService {
         let vmgs = build_vmgs(req_config.vmgs.take()).await?;
         let iommufds = IommufdContexts::new(std::mem::take(&mut req_config.iommufds))?;
 
-        // Snapshot the fd registry so tap NIC backends can resolve descriptors
-        // passed in over the fd-passing protocol.
+        // Snapshot the registry so devices can resolve resources passed in
+        // over the fd-passing or handle-passing protocol.
         let registry = self.registry.clone();
 
         // Serial ports are set up before the boot configuration because UEFI
@@ -960,10 +1139,10 @@ impl VmService {
         let any_serial_configured = ports.iter().any(|port| port.is_some());
         let com1_configured = ports[0].is_some();
 
-        #[cfg(guest_arch = "aarch64")]
-        let arch = vm_manifest_builder::MachineArch::Aarch64;
-        #[cfg(guest_arch = "x86_64")]
-        let arch = vm_manifest_builder::MachineArch::X86_64;
+        let arch = cfg_select! {
+            guest_arch = "x86_64" => vm_manifest_builder::MachineArch::X86_64,
+            guest_arch = "aarch64" => vm_manifest_builder::MachineArch::Aarch64,
+        };
 
         // Build SMBIOS identity for direct Linux or UEFI boot.
         let smbios_requested = req_config.smbios_config.is_some();
@@ -1164,6 +1343,17 @@ impl VmService {
         // `NumaConfig` are mutually exclusive (mirrors the CLI `--memory` vs
         // `--numa` conflict). `config_mem_size` is the total guest memory
         // reported to the `VmController`.
+        let memory_backing_file = req_config
+            .memory_config
+            .as_ref()
+            .and_then(|config| config.backing_file_path.as_deref())
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
+        if restore.is_some() && memory_backing_file.is_some() {
+            return Err(anyhow!(Code::InvalidArgument)
+                .context("memory backing file cannot be specified when restoring a snapshot"));
+        }
+
         let (numa, config_mem_size) = if let Some(numa_config) = req_config.numa_config.take() {
             if req_config.memory_config.is_some() {
                 bail!("memory_config and numa_config are mutually exclusive");
@@ -1309,8 +1499,7 @@ impl VmService {
                         instance_id,
                         resource,
                     } => {
-                        if !req_config.disable_vmbus && (cfg!(windows) || cfg!(target_os = "macos"))
-                        {
+                        if !req_config.disable_vmbus && cfg!(any(windows, target_os = "macos")) {
                             config.vpci_devices.push(VpciDeviceConfig {
                                 vtl: DeviceVtl::Vtl0,
                                 instance_id,
@@ -1325,10 +1514,10 @@ impl VmService {
             }
 
             for virtiofs in devices_config.virtiofs_config {
-                let resource = build_virtio_fs(virtiofs)?.into_resource();
+                let resource = build_virtio_fs(virtiofs, &registry)?.into_resource();
                 // Use VPCI when possible (currently only on Windows and macOS due
                 // to KVM backend limitations).
-                if cfg!(windows) || cfg!(target_os = "macos") {
+                if cfg!(any(windows, target_os = "macos")) {
                     config.vpci_devices.push(VpciDeviceConfig {
                         vtl: DeviceVtl::Vtl0,
                         instance_id: Guid::new_random(),
@@ -1352,7 +1541,7 @@ impl VmService {
                         })?;
                     let resource: Resource<VirtioDeviceHandle> =
                         virtio_resources::console::VirtioConsoleHandle { backend }.into_resource();
-                    if cfg!(windows) || cfg!(target_os = "macos") {
+                    if cfg!(any(windows, target_os = "macos")) {
                         // VMBus sorts VPCI offers by instance ID, comparing data1 first.
                         let instance_id = Guid {
                             data1: u32::try_from(index).unwrap(),
@@ -1376,6 +1565,7 @@ impl VmService {
                 .vmbus
                 .as_mut()
                 .context("HVSocket requires VMBus to be enabled")?;
+            crate::cleanup_socket(hvsocket_config.path.as_ref());
             let listener = UnixListener::bind(&hvsocket_config.path).with_context(|| {
                 format!("failed to bind hvsocket path: {}", hvsocket_config.path)
             })?;
@@ -1393,14 +1583,37 @@ impl VmService {
             .await
             .context("spawning vm process failed")?;
 
+        let (shared_memory, saved_state, active_memory_backing_file, snapshot_id) =
+            if let Some(restore) = &restore {
+                let prepared =
+                    prepare_snapshot_restore(restore, config_mem_size, config_proc_count)?;
+                (
+                    Some(prepared.shared_memory),
+                    Some(prepared.saved_state),
+                    Some(restore.source_dir.join("memory.bin")),
+                    Some(prepared.snapshot_id),
+                )
+            } else {
+                let shared_memory = memory_backing_file
+                    .as_ref()
+                    .map(|path| {
+                        openvmm_helpers::shared_memory::open_memory_backing_file(
+                            path,
+                            config_mem_size,
+                        )
+                    })
+                    .transpose()?;
+                (shared_memory, None, memory_backing_file, None)
+            };
+
         let worker = vm_host
             .launch_worker(
                 VM_WORKER,
                 VmWorkerParameters {
                     hypervisor: openvmm_helpers::hypervisor::choose_hypervisor()?,
                     cfg: config,
-                    saved_state: None,
-                    shared_memory: None,
+                    saved_state,
+                    shared_memory,
                     rpc: recv,
                     notify: notify_send,
                 },
@@ -1426,7 +1639,7 @@ impl VmService {
             vm_rpc: send.clone(),
             paravisor_diag: None,
             igvm_path,
-            memory_backing_file: None,
+            memory_backing_file: active_memory_backing_file.clone(),
             memory,
             processors,
             log_file: None,
@@ -1451,8 +1664,10 @@ impl VmService {
             worker_rpc: send,
             iommufds: Arc::new(iommufds),
         }));
+        self.snapshot_saved = false;
+        self.memory_backing_file = active_memory_backing_file;
         self.lifecycle = VmLifecycle::Paused;
-        Ok(())
+        Ok(snapshot_id)
     }
 
     async fn teardown_vm(&mut self) -> anyhow::Result<()> {
@@ -1470,6 +1685,8 @@ impl VmService {
         }
         self.vm_controller_events.take();
         self.lifecycle = VmLifecycle::Uninitialized;
+        self.snapshot_saved = false;
+        self.memory_backing_file = None;
         if let Some((_, response)) = self.wait_vm_response.take() {
             response.send(Err(grpc_error(anyhow!("VM torn down"))));
         }
@@ -1629,6 +1846,9 @@ impl VmService {
     }
 
     async fn resume_vm(&mut self) -> anyhow::Result<()> {
+        if self.snapshot_saved {
+            bail!("cannot resume a VM after SaveVM");
+        }
         let vm = self.vm.clone().context("VM not created yet")?;
         vm.worker_rpc
             .call(VmRpc::Resume, ())
@@ -1639,6 +1859,67 @@ impl VmService {
             self.lifecycle = VmLifecycle::Running;
         }
         Ok(())
+    }
+
+    async fn save_vm(
+        &mut self,
+        request: vmservice::SaveVmRequest,
+    ) -> anyhow::Result<vmservice::SaveVmResponse> {
+        if request.destination_dir.is_empty() {
+            return Err(
+                anyhow!(Code::InvalidArgument).context("missing snapshot destination directory")
+            );
+        }
+        if !matches!(self.lifecycle, VmLifecycle::Running | VmLifecycle::Paused) {
+            return Err(
+                anyhow!(Code::FailedPrecondition).context("SaveVM requires a running or paused VM")
+            );
+        }
+        // The snapshot shares the VM's memory backing file, so only one
+        // snapshot per VM is allowed.
+        if self.snapshot_saved {
+            return Err(anyhow!(Code::FailedPrecondition)
+                .context("VM already saved; tear down the VM or restore the snapshot"));
+        }
+        let controller = self
+            .vm_controller
+            .clone()
+            .ok_or_else(|| anyhow!(Code::FailedPrecondition).context("VM not created yet"))?;
+        if self.memory_backing_file.is_none() {
+            return Err(anyhow!(Code::FailedPrecondition)
+                .context("SaveVM requires MemoryConfig.backing_file_path"));
+        }
+        // Check the destination before the controller pauses the VM, so a
+        // rejected destination leaves the VM untouched.
+        openvmm_helpers::snapshot::check_snapshot_destination(Path::new(&request.destination_dir))
+            .map_err(|err| anyhow!(Code::FailedPrecondition).context(format!("{err:#}")))?;
+
+        // The controller pauses the VM and then writes the snapshot, which
+        // hard-links the guest memory backing file. Record that before
+        // awaiting: if this future is dropped (the client cancelled), the
+        // controller still finishes the save, and resuming would then write
+        // guest memory into the snapshot.
+        self.snapshot_saved = true;
+        self.lifecycle = VmLifecycle::Paused;
+
+        let result = controller
+            .call(VmControllerRpc::SaveSnapshot, request.destination_dir)
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r.map_err(anyhow::Error::from));
+        match result {
+            Ok(snapshot_id) => Ok(vmservice::SaveVmResponse {
+                snapshot_id: snapshot_id.to_string(),
+            }),
+            Err(err) => {
+                // On failure the controller removes the files it created, so
+                // no snapshot references guest memory and the VM may be
+                // resumed. The prechecks above ensure the controller paused
+                // the VM before failing, so the VM stays paused.
+                self.snapshot_saved = false;
+                Err(err).context("snapshot failed")
+            }
+        }
     }
 
     fn handle_controller_event(&mut self, event: VmControllerEvent) -> Option<i32> {
@@ -2018,7 +2299,7 @@ fn modify_consomme_nic(
 fn open_socket_backend(
     connect: bool,
 ) -> (
-    fn(&std::path::Path) -> std::io::Result<Resource<SerialBackendHandle>>,
+    fn(&Path) -> std::io::Result<Resource<SerialBackendHandle>>,
     &'static str,
 ) {
     if connect {
@@ -2176,7 +2457,7 @@ enum NicDevice {
 fn parse_nic_config(
     nic: vmservice::NicConfig,
     recv: Option<mesh::Receiver<ConsommeRequest>>,
-    registry: &FdRegistry,
+    registry: &ResourceRegistry,
 ) -> anyhow::Result<NicDevice> {
     use self::vmservice::nic_config::Backend;
     #[cfg(not(target_os = "linux"))]
@@ -2379,7 +2660,7 @@ struct BuiltPcieTopology {
 
 async fn build_pcie_topology(
     topology: vmservice::PcieTopologyConfig,
-    registry: &FdRegistry,
+    registry: &ResourceRegistry,
     iommufds: &IommufdContexts,
     enable_legacy_pci_config_io: bool,
 ) -> anyhow::Result<BuiltPcieTopology> {
@@ -2456,6 +2737,16 @@ async fn build_pcie_topology(
             vnode: node,
             preserve_bars,
         });
+    }
+
+    // Clean initial paths before creating any listeners. Hot-adds must not
+    // unlink a live device's socket.
+    for (_, device) in &pending_devices {
+        if let Some(vmservice::pcie_device_kind::Kind::Virtio(virtio)) = &device.kind
+            && let Some(vmservice::virtio_device::Kind::Vsock(vsock)) = &virtio.kind
+        {
+            crate::cleanup_socket(vsock.socket_path.as_ref());
+        }
     }
 
     let mut devices = Vec::new();
@@ -2579,7 +2870,7 @@ fn walk_pcie_attachment(
 /// function, an NVMe controller, or a VFIO-assigned host device).
 async fn build_pci_device(
     device: vmservice::PcieDeviceKind,
-    registry: &FdRegistry,
+    registry: &ResourceRegistry,
     iommufds: &IommufdContexts,
 ) -> anyhow::Result<Resource<PciDeviceHandleKind>> {
     use vmservice::pcie_device_kind::Kind;
@@ -2615,7 +2906,7 @@ fn build_vfio_device(
     if host_pci_address.contains('/') || host_pci_address.contains("..") {
         anyhow::bail!("PCI address must not contain path separators");
     }
-    let sysfs_path = std::path::Path::new("/sys/bus/pci/devices").join(&host_pci_address);
+    let sysfs_path = Path::new("/sys/bus/pci/devices").join(&host_pci_address);
     if let Some(iommu_id) = iommufd_id {
         let iommufd = iommufds.get(&iommu_id)?;
         let vfio_dev_dir = sysfs_path.join("vfio-dev");
@@ -2629,7 +2920,7 @@ fn build_vfio_device(
             .next()
             .context("no vfio-dev entry found")?
             .context("failed to read vfio-dev entry")?;
-        let dev_path = std::path::Path::new("/dev/vfio/devices").join(entry.file_name());
+        let dev_path = Path::new("/dev/vfio/devices").join(entry.file_name());
         let cdev = File::options()
             .read(true)
             .write(true)
@@ -2742,7 +3033,7 @@ async fn build_nvme_controller(
 /// `VirtioDevice`.
 async fn build_virtio_device(
     device: vmservice::VirtioDevice,
-    registry: &FdRegistry,
+    registry: &ResourceRegistry,
 ) -> anyhow::Result<Resource<VirtioDeviceHandle>> {
     use vmservice::virtio_device::Kind;
     let vmservice::VirtioDevice { kind } = device;
@@ -2758,6 +3049,7 @@ async fn build_virtio_device(
                 disk,
                 read_only,
                 serial,
+                options: Default::default(),
             }
             .into_resource()
         }
@@ -2804,7 +3096,16 @@ async fn build_virtio_device(
             virtio_resources::console::VirtioConsoleHandle { backend }.into_resource()
         }
         Kind::VhostUser(vhost_user) => build_vhost_user_device(vhost_user)?,
-        Kind::Fs(config) => build_virtio_fs(config)?.into_resource(),
+        Kind::Fs(config) => build_virtio_fs(config, registry)?.into_resource(),
+        Kind::Pmem(vmservice::VirtioPmem { backend, read_only }) => {
+            let path = match backend
+                .and_then(|b| b.kind)
+                .context("missing pmem backend")?
+            {
+                vmservice::pmem_backend::Kind::File(vmservice::PmemFile { path }) => path,
+            };
+            virtio_resources::pmem::VirtioPmemHandle { path, read_only }.into_resource()
+        }
     })
 }
 
@@ -2812,41 +3113,60 @@ const OPENVMM_DEFAULT_VSOCK_GUEST_CID: u64 = 3;
 
 fn build_virtio_fs(
     config: vmservice::VirtioFs,
+    registry: &ResourceRegistry,
 ) -> anyhow::Result<virtio_resources::fs::VirtioFsHandle> {
     let vmservice::VirtioFs {
         tag,
         root_path,
-        read_only,
+        mount_options,
+        windows_options,
     } = config;
-    const VIRTIO_FS_TAG_LEN: usize = 36;
-    anyhow::ensure!(!tag.is_empty(), "virtio-fs tag must not be empty");
-    anyhow::ensure!(
-        !tag.contains('\0'),
-        "virtio-fs tag must not contain NUL bytes"
-    );
-    anyhow::ensure!(
-        tag.len() <= VIRTIO_FS_TAG_LEN,
-        "virtio-fs tag exceeds the {VIRTIO_FS_TAG_LEN}-byte protocol limit"
-    );
-    anyhow::ensure!(
-        !root_path.is_empty(),
-        "virtio-fs root path must not be empty"
-    );
-    anyhow::ensure!(
-        !root_path.contains('\0'),
-        "virtio-fs root path must not contain NUL bytes"
-    );
+    let windows_options = windows_options
+        .map(|options| build_virtio_fs_windows_options(options, registry))
+        .transpose()?;
     Ok(virtio_resources::fs::VirtioFsHandle {
         tag,
         fs: virtio_resources::fs::VirtioFsBackend::HostFs {
             root_path,
-            mount_options: if read_only {
-                "ro".to_string()
-            } else {
-                String::new()
-            },
+            mount_options,
+            windows_options,
         },
     })
+}
+
+/// Resolves the proto virtio-fs Windows options, looking up the user token
+/// registered via the handle-passing protocol.
+fn build_virtio_fs_windows_options(
+    options: vmservice::virtio_fs::WindowsOptions,
+    registry: &ResourceRegistry,
+) -> anyhow::Result<virtio_resources::fs::VirtioFsWindowsOptions> {
+    let vmservice::virtio_fs::WindowsOptions {
+        user_token_name,
+        shared_mem,
+    } = options;
+    cfg_select! {
+        windows => {{
+            let user_token = (!user_token_name.is_empty())
+                .then(|| {
+                    registry.resolve(&user_token_name).with_context(|| {
+                        format!("failed to resolve virtio-fs user token '{user_token_name}'")
+                    })
+                })
+                .transpose()?;
+            Ok(virtio_resources::fs::VirtioFsWindowsOptions {
+                user_token,
+                shared_mem,
+            })
+        }}
+        _ => {{
+            let _ = registry;
+            anyhow::ensure!(
+                user_token_name.is_empty(),
+                "virtio-fs user tokens are only supported on Windows"
+            );
+            Ok(virtio_resources::fs::VirtioFsWindowsOptions { shared_mem })
+        }}
+    }
 }
 
 /// Builds a disk backend resource from the proto `DiskBackend`.
@@ -2946,7 +3266,7 @@ fn build_consomme_handle(
 /// Builds a host network endpoint resource from the proto `NicBackend`.
 fn build_nic_backend(
     backend: vmservice::NicBackend,
-    registry: &FdRegistry,
+    registry: &ResourceRegistry,
 ) -> anyhow::Result<Resource<NetEndpointHandleKind>> {
     use vmservice::nic_backend::Kind;
     #[cfg(not(target_os = "linux"))]
@@ -2976,7 +3296,7 @@ fn build_nic_backend(
 #[cfg(target_os = "linux")]
 fn build_tap_backend(
     tap: vmservice::TapBackend,
-    registry: &FdRegistry,
+    registry: &ResourceRegistry,
 ) -> anyhow::Result<Resource<NetEndpointHandleKind>> {
     use vmservice::tap_backend::Source;
     let fd = match tap.source.context("missing tap source")? {
@@ -3079,6 +3399,85 @@ mod tests {
     #[cfg(target_os = "linux")]
     use vmservice::vfio_bar_address::Source;
 
+    #[test]
+    fn virtio_fs_windows_options() {
+        for shared_mem in [None, Some(false), Some(true)] {
+            let resource = build_virtio_fs(
+                vmservice::VirtioFs {
+                    tag: "tag".into(),
+                    root_path: "root".into(),
+                    mount_options: String::new(),
+                    windows_options: shared_mem.map(|shared_mem| {
+                        vmservice::virtio_fs::WindowsOptions {
+                            user_token_name: String::new(),
+                            shared_mem,
+                        }
+                    }),
+                },
+                &ResourceRegistry::default(),
+            )
+            .unwrap();
+            let virtio_resources::fs::VirtioFsBackend::HostFs {
+                windows_options, ..
+            } = resource.fs
+            else {
+                panic!("expected host filesystem backend");
+            };
+            assert_eq!(
+                windows_options.map(|options| options.shared_mem),
+                shared_mem,
+            );
+        }
+    }
+
+    #[test]
+    fn virtio_vsock_reuses_socket_path() {
+        DefaultPool::run_with(async |_| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("vsock");
+            let device = vmservice::VirtioDevice {
+                kind: Some(vmservice::virtio_device::Kind::Vsock(
+                    vmservice::VirtioVsock {
+                        socket_path: path.to_str().unwrap().into(),
+                        guest_cid: None,
+                    },
+                )),
+            };
+            let config = vmservice::PcieTopologyConfig {
+                root_complexes: vec![vmservice::PcieRootComplex {
+                    root_ports: vec![vmservice::PciePort {
+                        attached: Some(vmservice::PcieAttachment {
+                            kind: Some(vmservice::pcie_attachment::Kind::Device(
+                                vmservice::PcieDeviceKind {
+                                    kind: Some(vmservice::pcie_device_kind::Kind::Virtio(
+                                        device.clone(),
+                                    )),
+                                },
+                            )),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let registry = ResourceRegistry::default();
+            let iommufds = IommufdContexts::default();
+            for _ in 0..2 {
+                let topology = build_pcie_topology(config.clone(), &registry, &iommufds, false)
+                    .await
+                    .unwrap();
+                assert!(
+                    build_virtio_device(device.clone(), &registry)
+                        .await
+                        .is_err()
+                );
+                let _connection = unix_socket::UnixStream::connect(&path).unwrap();
+                drop(topology);
+            }
+        });
+    }
+
     fn service(
         driver: DefaultDriver,
         shutdown_rpc: Option<mesh::Sender<ShutdownRpc>>,
@@ -3099,9 +3498,11 @@ mod tests {
             controller_task: None,
             wait_vm_response: None,
             lifecycle: VmLifecycle::Running,
+            snapshot_saved: false,
+            memory_backing_file: None,
             rpc_tasks: Vec::new(),
             transport: ResolvedTransport::Auto,
-            registry: FdRegistry::default(),
+            registry: ResourceRegistry::default(),
         }
     }
 
@@ -4021,9 +4422,11 @@ mod tests {
                     controller_task: None,
                     wait_vm_response: None,
                     lifecycle: VmLifecycle::Running,
+                    snapshot_saved: false,
+                    memory_backing_file: None,
                     rpc_tasks: vec![driver.spawn("pending-rpc", std::future::pending())],
                     transport: ResolvedTransport::Auto,
-                    registry: FdRegistry::default(),
+                    registry: ResourceRegistry::default(),
                 };
                 event_send.send(VmControllerEvent::ExitRequested { code });
                 assert_eq!(service.run(listener, worker_recv).await.unwrap(), code);
@@ -4110,7 +4513,7 @@ mod tests {
     fn uefi_custom_variables_file_errors() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing.json");
-        for path in [std::path::Path::new(""), missing.as_path(), dir.path()] {
+        for path in [Path::new(""), missing.as_path(), dir.path()] {
             let error = build_uefi_manifest(
                 vm_manifest_builder::MachineArch::X86_64,
                 vmservice::Uefi {
@@ -4390,7 +4793,7 @@ mod tests {
                     }],
                     ..Default::default()
                 },
-                &FdRegistry::default(),
+                &ResourceRegistry::default(),
                 &IommufdContexts::default(),
                 false,
             ));
@@ -4437,7 +4840,7 @@ mod tests {
 
         let topology = futures::executor::block_on(build_pcie_topology(
             topology,
-            &FdRegistry::default(),
+            &ResourceRegistry::default(),
             &IommufdContexts::default(),
             true,
         ))
@@ -4471,7 +4874,7 @@ mod tests {
                             }],
                             ..Default::default()
                         },
-                        &FdRegistry::default(),
+                        &ResourceRegistry::default(),
                         &IommufdContexts::default(),
                         false,
                     ))
